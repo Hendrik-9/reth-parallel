@@ -1,3 +1,4 @@
+use crate::stages::parallel_rebuild_state_root;
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockNumber, Sealable, B256};
 use reth_codecs::Compact;
@@ -168,7 +169,7 @@ impl MerkleStage {
 
 impl<Provider> Stage<Provider> for MerkleStage
 where
-    Provider: DBProvider<Tx: DbTxMut>
+    Provider: DBProvider<Tx: DbTxMut + Sync>
         + TrieWriter
         + StatsReader
         + HeaderProvider
@@ -216,6 +217,28 @@ where
 
         let (trie_root, entities_checkpoint) = if range.is_empty() {
             (target_block_root, input.checkpoint().entities_stage_checkpoint().unwrap_or_default())
+        } else if (to_block - from_block > threshold || from_block == 1) &&
+            !self
+                .get_execution_checkpoint(provider)?
+                .is_some_and(|checkpoint| checkpoint.target_block == to_block)
+        {
+            // Fresh rebuild: compute all storage roots in parallel. An in-flight sequential
+            // checkpoint for this target is still resumed by the branch below.
+            debug!(target: "sync::stages::merkle::exec", current = ?current_block_number, target = ?to_block, "Rebuilding trie in parallel");
+            self.save_execution_checkpoint(provider, None)?;
+            provider.tx_ref().clear::<tables::AccountsTrie>()?;
+            provider.tx_ref().clear::<tables::StoragesTrie>()?;
+
+            let total = (provider.count_entries::<tables::HashedAccounts>()? +
+                provider.count_entries::<tables::HashedStorages>()?) as u64;
+            let (root, processed) = parallel_rebuild_state_root(provider.tx_ref(), |updates| {
+                provider.write_trie_updates(updates).map(drop)
+            })
+            .map_err(|e| {
+                error!(target: "sync::stages::merkle", %e, ?current_block_number, ?to_block, "Parallel state root failed! {INVALID_STATE_ROOT_ERROR_MESSAGE}");
+                StageError::Fatal(Box::new(e))
+            })?;
+            (root, EntitiesCheckpoint { processed, total })
         } else if to_block - from_block > threshold || from_block == 1 {
             let mut checkpoint = self.get_execution_checkpoint(provider)?;
 

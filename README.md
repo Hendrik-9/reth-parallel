@@ -1,4 +1,76 @@
-# reth
+# reth-parallel
+
+A fork of [reth](https://github.com/paradigmxyz/reth) that parallelizes the full state trie
+rebuild in the Merkle stage across all available CPU cores.
+
+## Why?
+
+During initial sync, and for any block range above the rebuild threshold (100,000 blocks),
+the Merkle stage clears `AccountsTrie` and `StoragesTrie` and recomputes the state root from
+the hashed state tables. Upstream performs this rebuild on a single thread. The bulk of the
+work is computing storage roots, and the storage root of one account has no dependency on any
+other account, which makes the workload a natural fit for data parallelism.
+
+## Design
+
+The rebuild lives in
+[`crates/stages/stages/src/stages/merkle_parallel.rs`](crates/stages/stages/src/stages/merkle_parallel.rs)
+and proceeds in three steps per batch:
+
+1. Read the next 16,384 entries from `HashedAccounts` in key order.
+2. Compute the storage root and storage trie updates for every account in the batch in
+   parallel on the rayon thread pool. `par_iter().map().collect()` preserves input order.
+3. Feed the account leaves, in order, into a single `HashBuilder` and write the batch's
+   storage trie updates.
+
+Once all accounts have been processed, the account trie nodes are taken from the
+`HashBuilder` and written in one pass.
+
+Worker threads share the stage's existing read-write transaction rather than opening their
+own. reth opens MDBX with `MDBX_NOSTICKYTHREADS`, and every cursor operation in
+`reth-libmdbx` acquires the transaction lock, so concurrent use is safe. Database reads are
+serialized by that lock; keccak hashing and RLP encoding run concurrently. Opening a separate
+read-only transaction per worker would remove the lock contention, but read-only transactions
+cannot observe writes the pipeline has not yet committed, so that approach was not taken.
+
+Batching bounds memory to one batch of storage trie updates instead of the full set.
+
+If the stage finds an in-progress checkpoint from the sequential implementation for the same
+target block, it resumes through the original code path, so databases mid-rebuild from
+upstream reth are handled correctly.
+
+## Correctness
+
+The parallel path produces the same state root and the same `AccountsTrie` and
+`StoragesTrie` contents as upstream's sequential `StateRoot`. The test
+`parallel_rebuild_matches_sequential` builds a random state spanning more than one batch,
+with a mix of accounts with and without storage, runs both implementations, and asserts
+equality of the root and of the full sorted trie update set. The existing Merkle stage tests
+pass unchanged.
+
+## Benchmark
+
+Release build, 12 threads, 80,000 accounts with roughly 500,000 storage slots, mean of three
+runs:
+
+| Implementation        | Rebuild time |
+|-----------------------|--------------|
+| Upstream (sequential) | 576 ms       |
+| reth-parallel         | 262 ms       |
+
+The result is a 2.2x speedup. Scaling is sub-linear in core count because all database reads
+pass through the single shared transaction lock.
+
+## Limitations
+
+- The parallel rebuild runs to completion within one stage execution and does not write
+  intermediate checkpoints. A crash during the rebuild restarts it from the beginning.
+- Incremental trie updates for small block ranges, used after initial sync, remain
+  single-threaded.
+
+---
+
+## reth
 
 [![bench status](https://github.com/paradigmxyz/reth/actions/workflows/bench.yml/badge.svg)](https://github.com/paradigmxyz/reth/actions/workflows/bench.yml)
 [![CI status](https://github.com/paradigmxyz/reth/workflows/unit/badge.svg)][gh-ci]
